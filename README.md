@@ -11,7 +11,7 @@
 .
 ├── frontend/                 Vue 3 + Vite + TypeScript 前端
 │   ├── src/views/WorkbenchView.vue|tsx  全部模块共享工作台
-│   ├── src/data/modules.ts              18个业务模块配置
+│   ├── src/data/modules.ts              19个业务模块配置
 │   ├── src/api/              统一请求封装
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
@@ -68,6 +68,22 @@ npm run dev
 | 回填追踪 | `backfill_tracker` | 回填进度 | 追踪ID、回填任务、当前分区 |
 | 成本分析 | `cost_analysis` | 成本快照 | 快照日期、管线标识、计算时长 |
 | 告警策略 | `alert_policy` | 告警规则 | 规则名称、监控对象、告警条件 |
+| 回滚分区证据 | `rollback_partition_evidence` | 回滚分区证据 | 目标表、旧列名、有效分区清单、证据核验、path_version |
+
+## 删列回滚演练
+
+事实表删除旧金额列时，影响评估沿血缘边的实际消费方向（源节点 → 目标节点）
+逐跳遍历，覆盖事实表 → 日汇总 → 月汇总的传递链路与独立消费分支，共享目标只
+纳入一次；每个真实下游的回滚依赖都带旧列映射、有效分区证据和路径版本。
+
+流程接口（前缀 `/api/rollback`）：
+
+1. `POST /impact/evaluate`：评估删列传递影响，固化 `path_version`
+2. `POST /dependencies/build`：配置迁移读取回滚依赖，校验每个真实下游能否按旧列和有效分区恢复
+3. `POST /dependencies/validate`：逐下游确认回滚就绪（月汇总验证未结束时演练不可执行）
+4. `POST /drill/prepare`：建立演练输入，可回滚分区取各消费者有效分区的交集
+5. `POST /drill/run`：执行演练（`simulate_failure` 可模拟失败）
+6. `POST /drill/recover`：失败恢复，旧列映射与分区证据仍锁定该轮 `path_version`
 
 ## 约定
 

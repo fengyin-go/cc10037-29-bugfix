@@ -90,8 +90,11 @@ class SchemaEvolutionService(BaseModuleService):
     def analyze_field_impact(self, table_name: str, field_name: str) -> dict[str, Any]:
         """分析字段变更的影响范围。
 
-        通过 lineage_graph 血缘信息回溯该字段的下游使用情况，
-        统计受影响的处理和校验规则。
+        修复点：旧实现只扫描血缘边里直接包含该字段的一跳目标，经日汇总再
+        传递到月汇总这类多跳消费者会从详情目标表中丢失（关系遍历能看到月
+        汇总，影响详情却漏了它）。现改为沿血缘边实际消费方向（源节点 →
+        目标节点）逐跳 BFS，输出全部传递消费者；共享目标只纳入一次，并保留
+        每个目标的消费路径与跳数供核查。
         """
         changes = self.query_by_table(table_name)
         related_changes = [
@@ -100,11 +103,58 @@ class SchemaEvolutionService(BaseModuleService):
         ]
 
         lineage_edges = store.rows("lineage_graph") if "lineage_graph" in store._tables else []
-        affected_targets = []
+        col = field_name.strip().casefold()
+
+        def _edge_carries_field(edge: dict[str, Any]) -> bool:
+            fields = [
+                f.strip().casefold()
+                for f in str(edge.get("传递字段", "")).split(",") if f.strip()
+            ]
+            return col in fields
+
+        def _edge_active(edge: dict[str, Any]) -> bool:
+            return str(edge.get("是否活跃", "是")) == "是" and \
+                str(edge.get("status", "活跃")) == "活跃"
+
+        # 邻接表：仅保留活跃且传递该字段的边
+        adjacency: dict[str, list[dict[str, Any]]] = {}
         for edge in lineage_edges:
-            pass_fields = str(edge.get("传递字段", ""))
-            if field_name.casefold() in pass_fields.casefold():
-                affected_targets.append(edge.get("目标节点"))
+            if _edge_active(edge) and _edge_carries_field(edge):
+                adjacency.setdefault(str(edge.get("源节点", "")), []).append(edge)
+
+        # 沿实际消费方向 BFS，visited 保证共享目标只纳入一次
+        consumers: list[dict[str, Any]] = []
+        visited: set[str] = {table_name}
+        queue: list[tuple[str, int, list[dict[str, str]]]] = [(table_name, 0, [])]
+        while queue:
+            current, depth, path = queue.pop(0)
+            for edge in adjacency.get(current, []):
+                target = str(edge.get("目标节点", ""))
+                hop = {
+                    "source": current,
+                    "target": target,
+                    "transform": str(edge.get("转换类型", "identity")),
+                    "transfer_field": field_name,
+                }
+                next_path = [*path, hop]
+                if target not in visited:
+                    visited.add(target)
+                    consumers.append({
+                        "target_table": target,
+                        "depth": depth + 1,
+                        "direct_consumer": depth == 0,
+                        "lineage_path": next_path,
+                    })
+                    queue.append((target, depth + 1, next_path))
+
+        consumers.sort(key=lambda item: (item["depth"], item["target_table"]))
+        affected_targets = [item["target_table"] for item in consumers]
+        direct_targets = [
+            item["target_table"] for item in consumers if item["direct_consumer"]
+        ]
+        transitive_targets = [
+            item["target_table"] for item in consumers if not item["direct_consumer"]
+        ]
 
         quality_rules = store.rows("quality_rule") if "quality_rule" in store._tables else []
         affected_rules = []
@@ -117,10 +167,17 @@ class SchemaEvolutionService(BaseModuleService):
             "field": field_name,
             "change_history_count": len(related_changes),
             "affected_downstream_nodes": affected_targets,
+            "direct_consumers": direct_targets,
+            "transitive_consumers": transitive_targets,
+            "consumers": consumers,
             "affected_quality_rules": affected_rules,
             "total_impact_items": len(affected_targets) + len(affected_rules),
+            "affected_table_count": len(affected_targets),
+            "max_impact_depth": max((item["depth"] for item in consumers), default=0),
+            "one_hop_only": False,
             "risk_summary": (
-                "高影响：涉及多个下游节点和质量规则" if len(affected_targets) + len(affected_rules) > 3
+                "高影响：涉及多个下游节点和质量规则"
+                if len(affected_targets) + len(affected_rules) > 3
                 else "影响范围可控"
             ),
             "analyzed_at": datetime.now().isoformat(),

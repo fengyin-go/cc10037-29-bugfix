@@ -200,6 +200,17 @@ export const MODULES: ModuleMeta[] = [
     actionTargets: {"启用告警": "草稿", "静默告警": "已启用", "停用告警": "已启用"},
     metrics: ["规则总数", "已启用数", "靜默数"],
   },
+  {
+    key: "rollback_partition_evidence",
+    name: "回滚分区证据",
+    entity: "回滚分区证据",
+    desc: "管理删列回滚的旧列映射与有效分区证据，供配置迁移校验每个真实下游能否按旧列和有效分区恢复",
+    fields: ["目标表", "旧列名", "分区字段", "最早可用分区", "当前水位分区", "有效分区清单", "存量行数", "证据位置", "证据核验", "path_version"],
+    statuses: ["核验中", "已核验"],
+    actions: ["确认核验"],
+    actionTargets: {"确认核验": "核验中"},
+    metrics: ["证据总数", "已核验数", "核验中数"],
+  },
 ]
 
 export const MODULE_BY_KEY: Map<string, ModuleMeta> = new Map(

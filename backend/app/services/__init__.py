@@ -20,6 +20,7 @@ from app.services.schema_evolution import SchemaEvolutionService
 from app.services.backfill_tracker import BackfillTrackerService
 from app.services.cost_analysis import CostAnalysisService
 from app.services.alert_policy import AlertPolicyService
+from app.services.rollback_partition_evidence import RollbackPartitionEvidenceService
 
 SERVICES: dict[str, BaseModuleService] = {
     "pipeline_def": PipelineDefService(),
@@ -40,6 +41,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "backfill_tracker": BackfillTrackerService(),
     "cost_analysis": CostAnalysisService(),
     "alert_policy": AlertPolicyService(),
+    "rollback_partition_evidence": RollbackPartitionEvidenceService(),
 }
 
 

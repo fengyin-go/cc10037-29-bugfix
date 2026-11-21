@@ -10,6 +10,11 @@ from typing import Any
 
 from app.services.base import BaseModuleService
 from app.store import store
+from app.engine.rollback_recovery import RollbackRecoveryEngine
+
+
+# 模块级单例：回滚依赖与演练状态需要在多次请求间保持，且与血缘/证据同生命周期。
+rollback_engine = RollbackRecoveryEngine(store)
 
 
 class ConfigMigrationService(BaseModuleService):
@@ -143,6 +148,86 @@ class ConfigMigrationService(BaseModuleService):
             "safe_to_migrate": has_rollback,
             "validated_at": datetime.now().isoformat(),
         }
+
+    # ---- 删列迁移：读取回滚依赖数据并驱动回滚演练 ----
+
+    def load_rollback_dependencies(
+        self, source_table: str, dropped_column: str
+    ) -> dict[str, Any]:
+        """配置迁移读取回滚依赖数据。
+
+        先沿实际消费方向固化删列传递影响（路径版本），再为每个真实下游
+        校验能否按旧列和有效分区恢复，返回可核查的依赖清单。迁移清单表
+        数量与影响表数量在同一口径下保持一致，共享目标只纳入一次。
+        """
+        impact = rollback_engine.get_impact(source_table, dropped_column)
+        if impact is None:
+            impact = rollback_engine.evaluate_drop_impact(source_table, dropped_column)
+        summary = rollback_engine.build_rollback_dependencies(
+            source_table, dropped_column
+        )
+        summary["impact_table_count"] = impact["affected_table_count"]
+        summary["migration_list_count"] = summary["total_consumers"]
+        summary["count_consistent"] = (
+            summary["migration_list_count"] == summary["impact_table_count"]
+        )
+        return summary
+
+    def validate_downstream_recovery(
+        self,
+        source_table: str,
+        dropped_column: str,
+        target_table: str,
+        passed: bool,
+    ) -> dict[str, Any]:
+        """校验单个真实下游能否按旧列和有效分区恢复。
+
+        月汇总等传递消费者验证未结束时保持待验证状态，不允许提前判定就绪。
+        """
+        return rollback_engine.validate_consumer(
+            source_table, dropped_column, target_table, passed
+        )
+
+    def build_rollback_drill_input(
+        self, source_table: str, dropped_column: str
+    ) -> dict[str, Any]:
+        """据回滚依赖数据建立回滚演练输入。
+
+        可执行演练由全部下游验证通过决定；可回滚分区取各消费者有效分区
+        交集，即这些旧分区可供下游继续取数。
+        """
+        return rollback_engine.prepare_drill_input(source_table, dropped_column)
+
+    def execute_rollback_drill(
+        self,
+        source_table: str,
+        dropped_column: str,
+        *,
+        simulate_failure: bool = False,
+        failure_reason: str = "",
+    ) -> dict[str, Any]:
+        """执行回滚演练（可注入失败以模拟演练失败场景）。"""
+        return rollback_engine.run_drill(
+            source_table,
+            dropped_column,
+            simulate_failure=simulate_failure,
+            failure_reason=failure_reason,
+        )
+
+    def recover_failed_rollback_drill(
+        self, source_table: str, dropped_column: str
+    ) -> dict[str, Any]:
+        """演练失败后恢复：旧列映射与分区证据仍采用该轮路径版本。"""
+        return rollback_engine.recover_failed_drill(source_table, dropped_column)
+
+    def get_rollback_drill_status(
+        self, source_table: str, dropped_column: str
+    ) -> dict[str, Any]:
+        """查询当前演练状态与锁定的路径版本。"""
+        drill = rollback_engine.get_drill(source_table, dropped_column)
+        if drill is None:
+            return {"error": "尚未建立回滚演练输入"}
+        return drill
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
         entry, msg = super().run_action(entry_id, action)

@@ -46,61 +46,120 @@ class LineageGraphService(BaseModuleService):
                 result.append(dict(row))
         return result
 
-    def trace_field_lineage(self, field_name: str) -> dict[str, Any]:
+    def trace_field_lineage(self, field_name: str, source_node: str | None = None) -> dict[str, Any]:
         """追溯字段的端到端血缘链路。
 
-        从目标表出发，沿血缘边反向追溯字段的来源表和处理节点，
-        构建字段级数据流向图。
+        从源节点（未指定时从所有包含该字段的活跃边起点）出发，沿血缘边
+        实际消费方向（源节点 → 目标节点）逐跳 BFS，构建字段级数据流向图。
+        共享目标只纳入一次，传递消费者不会因为多跳而丢失。
         """
+        col = field_name.strip().casefold()
         edges = store.rows(self.MODULE)
         field_edges: list[dict[str, Any]] = []
+        visited: set[str] = set()
+
+        def _carries_field(edge: dict[str, Any]) -> bool:
+            return col in [
+                f.strip().casefold()
+                for f in str(edge.get("传递字段", "")).split(",") if f.strip()
+            ]
+
+        def _is_active(edge: dict[str, Any]) -> bool:
+            return str(edge.get("是否活跃", "是")) == "是" and \
+                str(edge.get("status", "活跃")) == "活跃"
+
+        adjacency: dict[str, list[dict[str, Any]]] = {}
+        roots: set[str] = set()
         for edge in edges:
-            pass_fields = str(edge.get("传递字段", ""))
-            if field_name.casefold() in pass_fields.casefold():
+            if not _is_active(edge) or not _carries_field(edge):
+                continue
+            src = str(edge.get("源节点", ""))
+            adjacency.setdefault(src, []).append(edge)
+            roots.add(src)
+
+        if source_node:
+            roots = {source_node}
+
+        queue: list[tuple[str, int]] = [(root, 0) for root in sorted(roots)]
+        enqueued: set[str] = set(roots)
+        while queue:
+            current, depth = queue.pop(0)
+            for edge in adjacency.get(current, []):
+                target = str(edge.get("目标节点", ""))
+                dedup_key = f"{current}->{target}"
+                if dedup_key in visited:
+                    continue
+                visited.add(dedup_key)
                 field_edges.append({
-                    "source": edge.get("源节点"),
-                    "target": edge.get("目标节点"),
+                    "source": current,
+                    "target": target,
                     "transform": edge.get("转换类型"),
                     "data_volume": edge.get("数据量级"),
-                    "depth": edge.get("血缘深度"),
+                    "depth": depth + 1,
+                    "direct": depth == 0,
+                    "transfer_field": field_name,
                 })
+                if target not in enqueued:
+                    enqueued.add(target)
+                    queue.append((target, depth + 1))
 
+        affected_tables = list(dict.fromkeys(item["target"] for item in field_edges))
         return {
             "field": field_name,
+            "source_node": source_node,
             "edge_count": len(field_edges),
             "lineage_chain": field_edges,
+            "affected_tables": affected_tables,
+            "affected_table_count": len(affected_tables),
             "traced_at": datetime.now().isoformat(),
         }
 
     def compute_impact_scope(self, source_node: str, max_depth: int = 5) -> dict[str, Any]:
         """计算源节点变更的影响范围。
 
-        向下游递归遍历血缘链路，统计受影响的表和处理节点数量，
-        用于变更审批和风险评估。
+        沿活跃血缘边的实际消费方向（源节点 → 目标节点）递归遍历，统计全部
+        受影响的表和处理节点数量，用于变更审批和风险评估。共享目标只纳入
+        一次，多跳传递消费者（如日汇总 → 月汇总）不会被漏算。
         """
-        all_downstream = self.query_downstream(source_node)
-        visited: set[str] = {source_node}
+        direct_edges = [
+            edge for edge in self.query_downstream(source_node)
+            if str(edge.get("是否活跃", "是")) == "是"
+            and str(edge.get("status", "活跃")) == "活跃"
+        ]
         affected_tables: set[str] = set()
-
-        def _traverse(target: str, depth: int):
-            if depth > max_depth:
-                return
-            for row in store.rows(self.MODULE):
-                tgt = str(row.get("目标节点", ""))
-                if target.casefold() in tgt.casefold() and tgt not in visited:
-                    visited.add(tgt)
-                    affected_tables.add(tgt)
-                    _traverse(tgt, depth + 1)
-
-        for edge in all_downstream:
+        max_reached_depth = 0
+        # BFS：visited 记录已入队节点，保证共享目标只纳入一次，
+        # 同时所有可达的多跳消费者都会被继续展开。
+        visited: set[str] = {source_node}
+        queue: list[tuple[str, int]] = []
+        for edge in direct_edges:
             tgt = str(edge.get("目标节点", ""))
-            _traverse(tgt, 1)
+            if tgt not in visited:
+                visited.add(tgt)
+                queue.append((tgt, 1))
+
+        while queue:
+            node, depth = queue.pop(0)
+            if depth > max_depth:
+                continue
+            affected_tables.add(node)
+            max_reached_depth = max(max_reached_depth, depth)
+            for edge in store.rows(self.MODULE):
+                if str(edge.get("是否活跃", "是")) != "是" or \
+                        str(edge.get("status", "活跃")) != "活跃":
+                    continue
+                if str(edge.get("源节点", "")) != node:
+                    continue
+                tgt = str(edge.get("目标节点", ""))
+                if tgt not in visited:
+                    visited.add(tgt)
+                    queue.append((tgt, depth + 1))
 
         return {
             "source": source_node,
-            "direct_downstream": len(all_downstream),
+            "direct_downstream": len(direct_edges),
             "total_affected": len(affected_tables),
-            "max_depth": max_depth,
+            "max_depth": max_reached_depth,
             "affected_tables": sorted(affected_tables),
             "computed_at": datetime.now().isoformat(),
         }
